@@ -7,7 +7,7 @@ import pydicom
 import re
 
 from tqdm import tqdm
-from pydicom.misc import is_dicom
+from pydicom.errors import InvalidDicomError
 from dicomtk.sql.models import Base, Patient, Image, Series, Study, MRIImage
 
 from sqlalchemy import create_engine
@@ -21,32 +21,6 @@ def sizeof_fmt(num, suffix="B"):
             return f"{num:3.1f}{unit}{suffix}"
         num /= 1024.0
     return f"{num:.1f}Yi{suffix}"
-
-
-def recursive_find_dicom_files(folder, strict_checking=True):
-    folder = pathlib.Path(folder)
-    all_files = folder.glob("**/*")
-    output = []
-    failed_dicoms = []
-    total_size = 0
-    for idx, fn in tqdm(enumerate(all_files)):
-
-        if not fn.is_file():
-            continue
-
-        if strict_checking:
-            try:
-                if not is_dicom(fn):
-                    failed_dicoms.append(fn)
-                    continue
-
-            except OSError:
-                failed_dicoms.append(fn)
-                continue
-        total_size += fn.stat().st_size
-        output.append(fn)
-
-    return output, failed_dicoms, total_size
 
 
 def populate_object_from_dicom(object, dcm_obj, tags, extra_fields=None, **kwargs):
@@ -78,6 +52,41 @@ def add_or_update(session, model, instance, **kwargs):
     return exists
 
 
+def import_into_db(session, tags, dcm_fn):
+    try:
+        dcm_obj = pydicom.read_file(dcm_fn, stop_before_pixels=True)
+    except InvalidDicomError:
+        return False
+    # Create Patient
+    # TODO: Create a partial always populating tags
+    patient = populate_object_from_dicom(Patient, dcm_obj, tags)
+    patient = add_or_update(session, Patient, patient, PatientID=patient.PatientID)
+
+    study = populate_object_from_dicom(Study, dcm_obj, tags, patient=patient)
+    study = add_or_update(
+        session, Study, study, StudyInstanceUID=study.StudyInstanceUID
+    )
+
+    series = populate_object_from_dicom(Series, dcm_obj, tags, study=study)
+    series = add_or_update(
+        session, Series, series, SeriesInstanceUID=series.SeriesInstanceUID
+    )
+
+    image = populate_object_from_dicom(
+        Image, dcm_obj, tags, extra_fields={"filename": str(dcm_fn)}, series=series
+    )
+    # Already imported images are skipped.
+    session.add(image)
+    session.commit()
+
+    # Check SOPClassUID if this is a MRI.
+    if dcm_obj.SOPClassUID == "1.2.840.10008.5.1.4.1.1.4":  # MR Image Storage
+        mri_image = populate_object_from_dicom(MRIImage, dcm_obj, tags, image=image)
+        session.add(mri_image)
+        session.commit()
+    return True
+
+
 def parse_dicom(path_to_dicom, database_fn):
     engine = create_engine(f"sqlite:///{database_fn.absolute()}")
     if not database_fn.exists():
@@ -89,12 +98,10 @@ def parse_dicom(path_to_dicom, database_fn):
     DBSession.bind = engine
     session = DBSession()
 
-    tqdm.write(f"Looking for dicom files in {path_to_dicom} recursively...")
-    dicoms, failed_dicoms, total_size = recursive_find_dicom_files(path_to_dicom)
-    tqdm.write(
-        f"Found {len(dicoms)} dicom files (total={sizeof_fmt(total_size)}) "
-        f"with {len(failed_dicoms)} skipped files."
-    )
+    tqdm.write(f"Looking for dicom files in {path_to_dicom} and adding to {database_fn}...")
+
+    path_to_dicom = pathlib.Path(path_to_dicom)
+    all_files = path_to_dicom.glob("**/*")
 
     # The table names correspond to the names in the DICOM standard,
     # we build the tags names here (excluding id and filenames)
@@ -110,45 +117,29 @@ def parse_dicom(path_to_dicom, database_fn):
 
     num_already_imported = 0
     num_imported = 0
-    for idx, dcm_fn in tqdm(enumerate(dicoms), total=len(dicoms)):
-        already_imported = session.query(Image).filter_by(filename=str(dcm_fn)).first()
-        if already_imported:
-            num_already_imported += 1
-            continue
+    total_size = 0
+    with tqdm(unit=" files") as pbar:
+        for idx, dcm_fn in enumerate(all_files):
+            if not dcm_fn.is_file():
+                continue
 
-        dcm_obj = pydicom.read_file(dcm_fn, stop_before_pixels=True)
+            already_imported = session.query(Image).filter_by(filename=str(dcm_fn)).first()
+            if already_imported:
+                num_already_imported += 1
+                continue
 
-        # Create Patient
-        # TODO: Create a partial always populating tags
-        patient = populate_object_from_dicom(Patient, dcm_obj, tags)
-        patient = add_or_update(session, Patient, patient, PatientID=patient.PatientID)
+            if not import_into_db(session, tags, dcm_fn):
+                with open("errors.log", "a") as f:
+                    f.write(str(dcm_fn) + "\n")
 
-        study = populate_object_from_dicom(Study, dcm_obj, tags, patient=patient)
-        study = add_or_update(
-            session, Study, study, StudyInstanceUID=study.StudyInstanceUID
-        )
+            total_size += dcm_fn.stat().st_size
+            num_imported += 1
+            pbar.update(1)
+            pbar.set_postfix({"total amount of data processed":f"{sizeof_fmt(total_size)}"})
 
-        series = populate_object_from_dicom(Series, dcm_obj, tags, study=study)
-        series = add_or_update(
-            session, Series, series, SeriesInstanceUID=series.SeriesInstanceUID
-        )
-
-        image = populate_object_from_dicom(
-            Image, dcm_obj, tags, extra_fields={"filename": str(dcm_fn)}, series=series
-        )
-        # Already imported images are skipped.
-        session.add(image)
-        session.commit()
-
-        # Check SOPClassUID if this is a MRI.
-        if dcm_obj.SOPClassUID == "1.2.840.10008.5.1.4.1.1.4":  # MR Image Storage
-            mri_image = populate_object_from_dicom(MRIImage, dcm_obj, tags, image=image)
-            session.add(mri_image)
-            session.commit()
-
-    num_imported += 1
     tqdm.write(
-        f"Imported {num_imported} dicom files (skipped {num_already_imported} already in database)."
+        f"Imported {num_imported} dicom files (total={sizeof_fmt(total_size)}), "
+        f"and skipped {num_already_imported} already in database."
     )
 
 
