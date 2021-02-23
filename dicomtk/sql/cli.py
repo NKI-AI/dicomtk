@@ -9,18 +9,10 @@ import re
 from tqdm import tqdm
 from pydicom.errors import InvalidDicomError
 from dicomtk.sql.models import Base, Patient, Image, Series, Study, MRIImage
+from dicomtk.utils import fast_scandir, sizeof_fmt
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
-
-def sizeof_fmt(num, suffix="B"):
-    # From: https://stackoverflow.com/a/1094933/576363
-    for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
-        if abs(num) < 1024.0:
-            return f"{num:3.1f}{unit}{suffix}"
-        num /= 1024.0
-    return f"{num:.1f}Yi{suffix}"
 
 
 def populate_object_from_dicom(object, dcm_obj, tags, extra_fields=None, **kwargs):
@@ -98,11 +90,11 @@ def parse_dicom(path_to_dicom, database_fn):
     DBSession.bind = engine
     session = DBSession()
 
-    tqdm.write(f"Looking for dicom files in {path_to_dicom} and adding to {database_fn}...")
-
-    path_to_dicom = pathlib.Path(path_to_dicom)
-    all_files = path_to_dicom.glob("**/*")
-
+    tqdm.write(
+        f"Looking for dicom folders in {path_to_dicom} and adding to {database_fn}..."
+    )
+    all_directories = fast_scandir(path_to_dicom)
+    tqdm.write(f"Found {len(all_directories)} folders to parse.")
     # The table names correspond to the names in the DICOM standard,
     # we build the tags names here (excluding id and filenames)
     objects_to_fill = [Patient, Study, Series, Image, MRIImage]
@@ -114,33 +106,57 @@ def parse_dicom(path_to_dicom, database_fn):
         ]
         for k in objects_to_fill
     }
+    files_added = 0
+    files_skipped = 0
+    total_size = 0
 
+    with tqdm(unit=" folders") as pbar:
+        for idx, folder in enumerate(all_directories):
+            curr_files_added, curr_files_skipped, curr_total_size = parse_dicom_folder(
+                folder, session, tags
+            )
+            files_added += curr_files_added
+            files_skipped += curr_files_skipped
+            total_size += curr_total_size
+
+            pbar.update(1)
+            pbar.set_postfix(
+                {
+                    "total amount of data processed": f"{sizeof_fmt(total_size)}",
+                    "files skipped": files_skipped,
+                    "files added": files_added,
+                }
+            )
+
+    tqdm.write(
+        f"Imported {files_added} dicom files (total={sizeof_fmt(total_size)}), "
+        f"and skipped {files_skipped} already in database."
+    )
+
+
+def parse_dicom_folder(folder, session, tags):
     num_already_imported = 0
     num_imported = 0
     total_size = 0
-    with tqdm(unit=" files") as pbar:
-        for idx, dcm_fn in enumerate(all_files):
-            if not dcm_fn.is_file():
-                continue
 
-            already_imported = session.query(Image).filter_by(filename=str(dcm_fn)).first()
-            if already_imported:
-                num_already_imported += 1
-                continue
+    all_files = folder.glob("*")
+    for dcm_fn in all_files:
+        if dcm_fn.is_dir():
+            continue
 
-            if not import_into_db(session, tags, dcm_fn):
-                with open("errors.log", "a") as f:
-                    f.write(str(dcm_fn) + "\n")
+        already_imported = session.query(Image).filter_by(filename=str(dcm_fn)).first()
+        if already_imported:
+            num_already_imported += 1
+            continue
 
-            total_size += dcm_fn.stat().st_size
-            num_imported += 1
-            pbar.update(1)
-            pbar.set_postfix({"total amount of data processed":f"{sizeof_fmt(total_size)}"})
+        if not import_into_db(session, tags, dcm_fn):
+            with open("errors.log", "a") as f:
+                f.write(str(dcm_fn) + "\n")
 
-    tqdm.write(
-        f"Imported {num_imported} dicom files (total={sizeof_fmt(total_size)}), "
-        f"and skipped {num_already_imported} already in database."
-    )
+        total_size += dcm_fn.stat().st_size
+        num_imported += 1
+
+    return num_imported, num_already_imported, total_size
 
 
 def main():
@@ -157,6 +173,11 @@ def main():
         type=pathlib.Path,
         default="dicomtosql.db",
         help="Path to SQLite database.",
+    )
+    parser.add_argument(
+        "--folders",
+        type=pathlib.Path,
+        help="Path to text file containing paths line by line to process for dicom files.",
     )
 
     args = parser.parse_args()
